@@ -6,8 +6,9 @@ use vars qw($VERSION $_LEVEL);
 use Net::DNS::Resolver;
 use IO::Select;
 use Time::HiRes;
+use Storable qw(freeze thaw);
 
-$VERSION = '1.04';
+$VERSION = '1.05';
 $_LEVEL = 0;
 
 sub new {
@@ -33,6 +34,15 @@ sub add {
 		die "add() requires a DNS query as trailing args";
 	}
 
+	# I wouldn't like to do this in a multi-threaded environment.
+	my $frozen = freeze(\@query);
+	for my $data (values %{ $self->{Queue} }) {
+		if ($frozen eq $data->[1]) {
+			push(@{ $data->[0] }, $callback);
+			return;
+		}
+	}
+
 	# if ($_LEVEL) { add to Pending } else { recv/send }
 
 	$self->recv(0);	# Perform fast case unconditionally.
@@ -44,7 +54,7 @@ sub add {
 		$self->recv();
 	}
 
-	my $data = [ $callback, \@query, 0, undef, undef ];
+	my $data = [ [ $callback ], $frozen, 0, undef, undef ];
 	$self->send($data);
 }
 
@@ -62,7 +72,8 @@ sub cleanup {
 sub send {
 	my ($self, $data) = @_;
 
-	my $socket = $self->{Resolver}->bgsend(@{$data->[1]});
+	my @query = @{ thaw($data->[1]) };
+	my $socket = $self->{Resolver}->bgsend(@query);
 
 	unless ($socket) {
 		die "No socket returned from bgsend()";
@@ -110,7 +121,7 @@ sub recv {
 		$socket->close();
 		eval {
 			local $_LEVEL = 1;
-			$data->[0]->($response);
+			$_->($response) for @{ $data->[0] };
 		};
 		if ($@) {
 			die "Async died within " . __PACKAGE__ . ": $@";
@@ -118,16 +129,16 @@ sub recv {
 	}
 
 	$time = time();
-	for (values %{ $self->{Queue} }) {
-		if ($_->[3] + $self->{Timeout} < $time) {
+	for my $data (values %{ $self->{Queue} }) {
+		if ($data->[3] + $self->{Timeout} < $time) {
 			# It timed out.
-			$self->cleanup($_);
-			if ($self->{Retries} < ++$_->[2]) {
+			$self->cleanup($data);
+			if ($self->{Retries} < ++$data->[2]) {
 				local $_LEVEL = 1;
-				$_->[0]->(undef);
+				$_->(undef) for @{ $data->[0] };
 			}
 			else {
-				$self->send($_);
+				$self->send($data);
 			}
 		}
 	}
@@ -169,6 +180,13 @@ the callback will be called at some point in the future without
 further intervention from the user application. The application need
 not handle selects, timeouts, waiting for a response or any other
 such issues.
+
+If the same query is added to the queue more than once, the module
+may combine the queries; that is, it will perform the query only
+once, and will call each callback registered for that query in turn,
+passing the same Net::DNS::Response object to each query. For this
+reason, you should not modify the Net::DNS::Response object in any
+way lest you break things horribly for a subsequent callback.
 
 This module is similar in principle to POE::Component::Client::DNS,
 but does not require POE.

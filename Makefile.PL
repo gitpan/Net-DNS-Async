@@ -7,6 +7,8 @@ WriteMakefile(
     'PREREQ_PM'		=> {
 				'Test::More'	=> 0,
 				'Net::DNS'		=> 0,
+				'IO::Select'	=> 0,
+				'Storable'		=> 0,
 			},
 	ABSTRACT_FROM => 'lib/Net/DNS/Async.pm',
 	AUTHOR     => 'Shevek <cpan@anarres.org>',
