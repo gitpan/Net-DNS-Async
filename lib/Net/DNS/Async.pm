@@ -3,12 +3,20 @@ package Net::DNS::Async;
 use strict;
 use warnings;
 use vars qw($VERSION $_LEVEL);
+use constant {
+	NDS_CALLBACKS => 0,
+	NDS_RESOLVER  => 1,
+	NDS_FQUERY    => 2,
+	NDS_RETRIES   => 3,
+	NDS_SENDTIME  => 4,
+	NDS_SOCKET    => 5,
+};
 use Net::DNS::Resolver;
 use IO::Select;
 use Time::HiRes;
 use Storable qw(freeze thaw);
 
-$VERSION = '1.05';
+$VERSION = '1.06';
 $_LEVEL = 0;
 
 sub new {
@@ -25,21 +33,38 @@ sub new {
 }
 
 sub add {
-	my ($self, $callback, @query) = @_;
+	my ($self, $params, @query) = @_;
+	my ($callback, @ns);
+
+	if (ref($params) eq 'HASH') {
+		@query = @{ $params->{Query} } if exists $params->{Query};
+		$callback = $params->{Callback};
+		@ns = @{ $params->{Nameservers} }
+				if exists $params->{Nameservers};
+	}
+	else {
+		$callback = $params;
+	}
 
 	unless (ref($callback) eq 'CODE') {
-		die "add() requires a CODE reference as first arg";
+		die "add() requires a CODE reference for a callback";
 	}
 	unless (@query) {
-		die "add() requires a DNS query as trailing args";
+		die "add() requires a DNS query";
 	}
 
-	# I wouldn't like to do this in a multi-threaded environment.
 	my $frozen = freeze(\@query);
-	for my $data (values %{ $self->{Queue} }) {
-		if ($frozen eq $data->[1]) {
-			push(@{ $data->[0] }, $callback);
-			return;
+	unless (@ns) {
+		# It's a regular boring query, we can fold it.
+		# I wouldn't like to do this in a multi-threaded environment.
+		for my $data (values %{ $self->{Queue} }) {
+			if ($frozen eq $data->[NDS_FQUERY]) {
+				# Allow the use of slot 0 for custom hacks.
+				unless ($data->[NDS_RESOLVER]) {
+					push(@{ $data->[NDS_CALLBACKS] }, $callback);
+					return;
+				}
+			}
 		}
 	}
 
@@ -54,14 +79,21 @@ sub add {
 		$self->recv();
 	}
 
-	my $data = [ [ $callback ], $frozen, 0, undef, undef ];
+	# [ [ $callback ], $frozen, 0, undef, undef ];
+	my $data = [ ];
+	$data->[NDS_CALLBACKS] = [ $callback ];
+	$data->[NDS_RESOLVER] = new Net::DNS::Resolver(
+		nameservers	=> \@ns
+			) if @ns;
+	$data->[NDS_FQUERY] = $frozen;
+	$data->[NDS_RETRIES] = 0;
 	$self->send($data);
 }
 
 sub cleanup {
 	my ($self, $data) = @_;
 
-	my $socket = $data->[4];
+	my $socket = $data->[NDS_SOCKET];
 	if ($socket) {
 		$self->{Selector}->remove($socket);
 		delete $self->{Queue}->{$socket->fileno};
@@ -72,8 +104,9 @@ sub cleanup {
 sub send {
 	my ($self, $data) = @_;
 
-	my @query = @{ thaw($data->[1]) };
-	my $socket = $self->{Resolver}->bgsend(@query);
+	my @query = @{ thaw($data->[NDS_FQUERY]) };
+	my $resolver = $data->[NDS_RESOLVER] || $self->{Resolver};
+	my $socket = $resolver->bgsend(@query);
 
 	unless ($socket) {
 		die "No socket returned from bgsend()";
@@ -82,8 +115,8 @@ sub send {
 		die "Socket returned from bgsend() has no fileno";
 	}
 
-	$data->[3] = time();
-	$data->[4] = $socket;
+	$data->[NDS_SENDTIME] = time();
+	$data->[NDS_SOCKET]   = $socket;
 
 	$self->{Queue}->{$socket->fileno} = $data;
 	$self->{Selector}->add($socket);
@@ -97,7 +130,7 @@ sub recv {
 		$time = time();
 		# Find first timer.
 		for (values %{ $self->{Queue} }) {
-			$time = $_->[3] if $_->[3] < $time;
+			$time = $_->[NDS_SENDTIME] if $_->[NDS_SENDTIME] < $time;
 		}
 		# Add timeout, and compute delay until then.
 		$time = $time + $self->{Timeout} - time();
@@ -121,7 +154,7 @@ sub recv {
 		$socket->close();
 		eval {
 			local $_LEVEL = 1;
-			$_->($response) for @{ $data->[0] };
+			$_->($response) for @{ $data->[NDS_CALLBACKS] };
 		};
 		if ($@) {
 			die "Async died within " . __PACKAGE__ . ": $@";
@@ -130,12 +163,12 @@ sub recv {
 
 	$time = time();
 	for my $data (values %{ $self->{Queue} }) {
-		if ($data->[3] + $self->{Timeout} < $time) {
+		if ($data->[NDS_SENDTIME] + $self->{Timeout} < $time) {
 			# It timed out.
 			$self->cleanup($data);
-			if ($self->{Retries} < ++$data->[2]) {
+			if ($self->{Retries} < ++$data->[NDS_RETRIES]) {
 				local $_LEVEL = 1;
-				$_->(undef) for @{ $data->[0] };
+				$_->(undef) for @{ $data->[NDS_CALLBACKS] };
 			}
 			else {
 				$self->send($data);
