@@ -16,7 +16,7 @@ use IO::Select;
 use Time::HiRes;
 use Storable qw(freeze thaw);
 
-$VERSION = '1.06';
+$VERSION = '1.07';
 $_LEVEL = 0;
 
 sub new {
@@ -138,7 +138,7 @@ sub recv {
 		$time = 0 if $time < 0;
 	}
 
-	my @sockets = $self->{Selector}->can_read($time - time());
+	my @sockets = $self->{Selector}->can_read($time);
 	for my $socket (@sockets) {
 		# If we recursed from the user callback into add(), then
 		# we might have read from and closed this socket.
